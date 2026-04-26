@@ -1,14 +1,10 @@
+import struct
 from pathlib import Path
 
 import pytest
+from pytest_mock import MockerFixture
 
 from unicorn_linker import Library, Linker, load
-
-
-@pytest.fixture
-def mock_library(tmp_path: Path) -> Path:
-    """Create a minimal mock ARM64 library for testing."""
-    return tmp_path / "mock_lib.so"
 
 
 @pytest.fixture
@@ -36,6 +32,14 @@ class TestLinkerInit:
         """Test that symbols dictionary starts empty."""
         assert linker.symbols == {}
 
+    def test_linker_repr(self, linker: Linker) -> None:
+        """Test Linker __repr__ contains expected fields."""
+        r = repr(linker)
+        assert "Linker(" in r
+        assert "lib_addr=" in r
+        assert "jni_addr=" in r
+        assert "symbols=" in r
+
 
 class TestLinkerMemoryAllocation:
     """Tests for memory allocation."""
@@ -54,11 +58,21 @@ class TestLinkerLoadLibrary:
             linker.load_library("/nonexistent/path/lib.so")
 
     def test_load_library_success(self, linker: Linker, tmp_path: Path) -> None:
-        """Test loading library succeeds."""
+        """Test loading library succeeds and data is written to memory."""
+        payload = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 100
         lib_path = tmp_path / "test.so"
-        lib_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 100)
+        lib_path.write_bytes(payload)
         size = linker.load_library(str(lib_path))
-        assert size > 100
+        assert size == len(payload)
+        mem = bytes(linker.mu.mem_read(linker.lib_addr, len(payload)))
+        assert mem == payload
+
+    def test_load_library_too_large(self, linker: Linker, tmp_path: Path) -> None:
+        """Test that loading a library exceeding 32 MB raises ValueError."""
+        lib_path = tmp_path / "big.so"
+        lib_path.write_bytes(b"\x00" * (Linker.MAX_LIB_SIZE + 1))
+        with pytest.raises(ValueError, match="Library too large"):
+            linker.load_library(str(lib_path))
 
 
 class TestLinkerGetFunctions:
@@ -78,6 +92,20 @@ class TestLinkerApplyRelocations:
         with pytest.raises(FileNotFoundError):
             linker.apply_relocations("/nonexistent/path/lib.so")
 
+    def test_apply_relocations_resets_stub_idx(
+        self, linker: Linker, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
+        """Test that apply_relocations resets stub_idx on each call."""
+        lib_path = tmp_path / "test.so"
+        lib_path.write_bytes(b"\x00" * 8)
+        mocker.patch(
+            "subprocess.run",
+            return_value=mocker.Mock(returncode=0, stdout="", stderr=""),
+        )
+        linker.stub_idx = 5
+        linker.apply_relocations(str(lib_path))
+        assert linker.stub_idx == 0
+
 
 class TestLinkerCall:
     """Tests for call method."""
@@ -85,6 +113,11 @@ class TestLinkerCall:
     def test_call_with_no_args(self, linker: Linker) -> None:
         """Test call with no arguments."""
         result = linker.call(0, timeout=1000)
+        assert isinstance(result, int)
+
+    def test_call_custom_timeout(self, linker: Linker) -> None:
+        """Test call with a custom timeout value."""
+        result = linker.call(0, timeout=500)
         assert isinstance(result, int)
 
 
@@ -100,6 +133,17 @@ class TestLinkerSetInput:
         """Test set_input with normal string."""
         addr = linker.set_input("hello")
         assert addr == linker.input_addr
+
+    def test_set_input_data_written(self, linker: Linker) -> None:
+        """Test that set_input writes the encoded string to memory."""
+        linker.set_input("hi")
+        mem = bytes(linker.mu.mem_read(linker.input_addr, 3))
+        assert mem == b"hi\x00"
+
+    def test_set_input_too_large(self, linker: Linker) -> None:
+        """Test that set_input raises ValueError when input exceeds buffer."""
+        with pytest.raises(ValueError, match="Input too large"):
+            linker.set_input("x" * Linker.MAX_INPUT_SIZE)
 
 
 class TestLinkerGetOutput:
@@ -123,6 +167,18 @@ class TestLinkerSetJniEntry:
         """Test set_jni_entry."""
         linker.set_jni_entry(0, 0x10000000)
         linker.set_jni_entry(1, 0x20000000)
+
+    def test_set_jni_entry_readback(self, linker: Linker) -> None:
+        """Test that set_jni_entry writes the correct value to memory."""
+        linker.set_jni_entry(0, 0xDEADBEEF)
+        raw = bytes(linker.mu.mem_read(linker.jni_addr, 8))
+        assert struct.unpack("<Q", raw)[0] == 0xDEADBEEF
+
+    def test_set_jni_entry_index_offset(self, linker: Linker) -> None:
+        """Test that set_jni_entry at index 2 writes at offset 16."""
+        linker.set_jni_entry(2, 0xCAFEBABE)
+        raw = bytes(linker.mu.mem_read(linker.jni_addr + 2 * 8, 8))
+        assert struct.unpack("<Q", raw)[0] == 0xCAFEBABE
 
 
 class TestLinkerPatch:
@@ -149,6 +205,30 @@ class TestLinkerFindFunctionByPrefix:
         with pytest.raises(FileNotFoundError):
             linker.find_function_by_prefix("/nonexistent.so", "NonExistent")
 
+    def test_find_function_by_prefix_found(
+        self, linker: Linker, mocker: MockerFixture
+    ) -> None:
+        """Test find_function_by_prefix returns address when prefix matches."""
+        mocker.patch.object(
+            linker,
+            "get_functions",
+            return_value={"myFunc": 0x1234, "otherFunc": 0x5678},
+        )
+        addr = linker.find_function_by_prefix("dummy.so", "myF")
+        assert addr == 0x1234
+
+    def test_find_function_by_prefix_no_match(
+        self, linker: Linker, mocker: MockerFixture
+    ) -> None:
+        """Test find_function_by_prefix returns None when no prefix matches."""
+        mocker.patch.object(
+            linker,
+            "get_functions",
+            return_value={"myFunc": 0x1234},
+        )
+        result = linker.find_function_by_prefix("dummy.so", "xyz")
+        assert result is None
+
 
 class TestLibrary:
     """Tests for Library class."""
@@ -157,6 +237,14 @@ class TestLibrary:
         """Test Library with non-existent file raises FileNotFoundError."""
         with pytest.raises(FileNotFoundError):
             Library("/nonexistent/path/lib.so")
+
+    def test_library_call_passes_timeout(self, mocker: MockerFixture) -> None:
+        """Test that Library.__call__ forwards timeout to Linker.call."""
+        lib = mocker.MagicMock(spec=Library)
+        lib.linker = mocker.MagicMock()
+        lib.linker.call.return_value = 42
+        Library.__call__(lib, 0x100, 1, 2, timeout=9999)
+        lib.linker.call.assert_called_once_with(0x100, 1, 2, timeout=9999)
 
 
 class TestLoad:
