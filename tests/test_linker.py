@@ -74,6 +74,16 @@ class TestLinkerLoadLibrary:
         with pytest.raises(ValueError, match="Library too large"):
             linker.load_library(str(lib_path))
 
+    def test_load_library_max_size(self, linker: Linker, tmp_path: Path) -> None:
+        """Test that a library exactly at MAX_LIB_SIZE loads successfully."""
+        lib_path = tmp_path / "max_size.so"
+        lib_bytes = b"\x00" * Linker.MAX_LIB_SIZE
+        lib_path.write_bytes(lib_bytes)
+        size = linker.load_library(str(lib_path))
+        assert size == Linker.MAX_LIB_SIZE
+        mem = bytes(linker.mu.mem_read(linker.lib_addr, Linker.MAX_LIB_SIZE))
+        assert mem == lib_bytes
+
 
 class TestLinkerGetFunctions:
     """Tests for get_functions method."""
@@ -144,6 +154,14 @@ class TestLinkerSetInput:
         """Test that set_input raises ValueError when input exceeds buffer."""
         with pytest.raises(ValueError, match="Input too large"):
             linker.set_input("x" * Linker.MAX_INPUT_SIZE)
+
+    def test_set_input_max_length(self, linker: Linker) -> None:
+        """Test that set_input accepts the maximum allowed input size."""
+        max_input = "x" * (Linker.MAX_INPUT_SIZE - 1)
+        addr = linker.set_input(max_input)
+        assert addr == linker.input_addr
+        mem = bytes(linker.mu.mem_read(linker.input_addr, Linker.MAX_INPUT_SIZE))
+        assert mem == max_input.encode("utf-8") + b"\x00"
 
 
 class TestLinkerGetOutput:
@@ -239,12 +257,20 @@ class TestLibrary:
             Library("/nonexistent/path/lib.so")
 
     def test_library_call_passes_timeout(self, mocker: MockerFixture) -> None:
-        """Test that Library.__call__ forwards timeout to Linker.call."""
+        """Test that Library.__call__ forwards timeout to Linker.call when explicitly provided."""
         lib = mocker.MagicMock(spec=Library)
         lib.linker = mocker.MagicMock()
         lib.linker.call.return_value = 42
         Library.__call__(lib, 0x100, 1, 2, timeout=9999)
         lib.linker.call.assert_called_once_with(0x100, 1, 2, timeout=9999)
+
+    def test_library_call_uses_default_timeout(self, mocker: MockerFixture) -> None:
+        """Test that Library.__call__ uses the default timeout when none is provided."""
+        lib = mocker.MagicMock(spec=Library)
+        lib.linker = mocker.MagicMock()
+        lib.linker.call.return_value = 42
+        Library.__call__(lib, 0x100, 1, 2)
+        lib.linker.call.assert_called_once_with(0x100, 1, 2, timeout=100000)
 
 
 class TestLoad:

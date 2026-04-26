@@ -340,18 +340,20 @@ class Library:
         self.functions = self.linker.get_functions(path)
         logger.info("Functions: %d", len(self.functions))
 
-    def __call__(self, offset: int, *args: int, timeout: int = 100000) -> int:
+    def __call__(self, offset: int, *args: int, timeout: int | None = None) -> int:
         """Shortcut to call function.
 
         Args:
             offset: Function offset.
             *args: Arguments to pass.
-            timeout: Emulation timeout in microseconds (default: 100000).
+            timeout: Emulation timeout in microseconds. Defaults to Linker.call default.
 
         Returns:
             Return value from function.
         """
-        return self.linker.call(offset, *args, timeout=timeout)
+        return self.linker.call(
+            offset, *args, timeout=timeout if timeout is not None else 100000
+        )
 
 
 def load(path: str) -> Library:
