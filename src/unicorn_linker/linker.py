@@ -1,3 +1,4 @@
+import logging
 import os
 import struct
 import subprocess
@@ -7,6 +8,8 @@ from unicorn.arm64_const import (
     UC_ARM64_REG_SP,
     UC_ARM64_REG_X0,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Linker:
@@ -22,6 +25,8 @@ class Linker:
     INPUT_ADDR: int = 0x600000
     OUTPUT_ADDR: int = 0x700000
     ZERO_PAGE_ADDR: int = 0x0
+    MAX_LIB_SIZE: int = 0x2000000  # 32 MB
+    MAX_INPUT_SIZE: int = 0x100000  # 1 MB
 
     def __init__(self) -> None:
         """Initialize ARM64 emulator with default memory regions."""
@@ -36,6 +41,13 @@ class Linker:
 
         self.symbols: dict[str, int] = {}
         self.stub_idx = 0
+
+    def __repr__(self) -> str:
+        """Return string representation of Linker."""
+        return (
+            f"Linker(lib_addr=0x{self.lib_addr:x}, jni_addr=0x{self.jni_addr:x}, "
+            f"symbols={len(self.symbols)})"
+        )
 
     def _alloc_memory(self) -> None:
         """Allocate memory for emulated regions."""
@@ -67,6 +79,11 @@ class Linker:
 
         with open(path, "rb") as f:
             data = f.read()
+
+        if len(data) > self.MAX_LIB_SIZE:
+            raise ValueError(
+                f"Library too large: {len(data)} bytes (max {self.MAX_LIB_SIZE})"
+            )
 
         self.mu.mem_write(self.lib_addr, data)
         return len(data)
@@ -103,11 +120,7 @@ class Linker:
                     try:
                         addr = int(parts[1], 16)
                         name = parts[-1]
-                        if (
-                            not name.startswith("_")
-                            and not name.startswith("__")
-                            and len(name) > 2
-                        ):
+                        if not name.startswith("_") and len(name) > 2:
                             funcs[name] = addr
                     except (ValueError, IndexError):
                         pass
@@ -135,6 +148,7 @@ class Linker:
             raise RuntimeError(f"readelf failed: {result.stderr}")
 
         self.symbols = {}
+        self.stub_idx = 0
 
         for line in result.stdout.splitlines():
             if not line.strip() or line.startswith("Relocation"):
@@ -236,8 +250,16 @@ class Linker:
 
         Returns:
             Address of input buffer.
+
+        Raises:
+            ValueError: If encoded text exceeds input buffer capacity.
         """
-        self.mu.mem_write(self.input_addr, text.encode() + b"\x00")
+        encoded = text.encode() + b"\x00"
+        if len(encoded) > self.MAX_INPUT_SIZE:
+            raise ValueError(
+                f"Input too large: {len(encoded)} bytes (max {self.MAX_INPUT_SIZE})"
+            )
+        self.mu.mem_write(self.input_addr, encoded)
         return self.input_addr
 
     def get_output(self, size: int = 0x1000) -> bytes:
@@ -310,25 +332,26 @@ class Library:
         self.linker = Linker()
 
         size = self.linker.load_library(path)
-        print(f"[+] Loaded: {size} bytes")
+        logger.info("Loaded: %d bytes", size)
 
         rels = self.linker.apply_relocations(path)
-        print(f"[+] Relocations: {rels[0]} RELATIVE + {rels[1]} FUNC")
+        logger.info("Relocations: %d RELATIVE + %d FUNC", rels[0], rels[1])
 
         self.functions = self.linker.get_functions(path)
-        print(f"[+] Functions: {len(self.functions)}")
+        logger.info("Functions: %d", len(self.functions))
 
-    def __call__(self, offset: int, *args: int) -> int:
+    def __call__(self, offset: int, *args: int, timeout: int = 100000) -> int:
         """Shortcut to call function.
 
         Args:
             offset: Function offset.
             *args: Arguments to pass.
+            timeout: Emulation timeout in microseconds (default: 100000).
 
         Returns:
             Return value from function.
         """
-        return self.linker.call(offset, *args)
+        return self.linker.call(offset, *args, timeout=timeout)
 
 
 def load(path: str) -> Library:
